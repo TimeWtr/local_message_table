@@ -1,0 +1,11 @@
+#!/bin/bash
+
+result=$(make check)
+printf "执行检查..."
+
+if [ -n "$result" ]; then
+  echo >&2 "[ERROR] 有文件发生变更，请将变更文件添加到本次提交中"
+  exit 1
+fi
+
+exit 0
