@@ -120,15 +120,15 @@ func (m *MessageTable) AsyncWork(ctx context.Context) error {
 		dt := d
 		for _, table := range dt.tables {
 			eg.Go(func() error {
-				select {
-				case <-ctx.Done():
-					return ctx.Err()
-				case <-m.closeCh:
-					return nil
-				default:
-				}
-
 				for {
+					select {
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-m.closeCh:
+						return nil
+					default:
+					}
+
 					ctxl, cancel := context.WithTimeout(ctx, time.Second)
 					now := time.Now().UnixMilli() - m.interval.Milliseconds()
 					var msgs []Messages
@@ -164,7 +164,7 @@ func (m *MessageTable) AsyncWork(ctx context.Context) error {
 						continue
 					}
 
-					// 批量更新消息状态，这个地方可能会出现更新失败但推送成功的情况，还会被二次捞出来发送
+					// 批量更新消息状态，这个地方可能会出现更新失败但推送成功的情况，还会被捞出来发送
 					// 消息消费方需要实现消息幂等
 					ctxl, cancel = context.WithTimeout(ctx, time.Second)
 					err = dt.db.WithContext(ctxl).Model(&Messages{}).
