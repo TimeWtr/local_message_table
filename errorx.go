@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package service
+package local_message_table
 
-type Service struct {
-}
+import "errors"
+
+var (
+	ErrTopicEmpty   = errors.New("topic is empty")
+	ErrContentEmpty = errors.New("content is empty")
+)
