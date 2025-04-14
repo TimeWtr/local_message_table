@@ -1,0 +1,2 @@
+# local_message_table
+基于Go封装的分布式事务本地消息表方案
