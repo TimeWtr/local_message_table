@@ -20,3 +20,7 @@ var (
 	ErrTopicEmpty   = errors.New("topic is empty")
 	ErrContentEmpty = errors.New("content is empty")
 )
+
+var (
+	ErrOverLimit = errors.New("middleware error and over max rate")
+)
