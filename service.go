@@ -15,6 +15,7 @@
 package local_message_table
 
 import (
+	"errors"
 	"sync"
 	"time"
 
@@ -24,6 +25,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/TimeWtr/Bitly/pkg/logger"
+	dl "github.com/TimeWtr/dis_lock"
 )
 
 var (
@@ -35,7 +37,7 @@ var (
 type BizFn func(ctx context.Context, tx *gorm.DB) (Messages, error)
 
 // ShardingFn 执行分片的方法
-type ShardingFn func(ctx context.Context, key any) (Dst, error)
+type ShardingFn func(key any) (Dst, error)
 
 type Options func(*MessageTable)
 
@@ -87,12 +89,19 @@ type MessageTable struct {
 	limit int
 	// 日志适配器
 	l logger.Logger
+	// 分布式锁控制只有一个实例可以真正运行后台的异步补偿任务
+	lock *dl.Client
+	// 限流器，控制中间件错误的频率，当指定窗口周期内超过一定频率的中间件错误(MySQL、Kafka)，
+	// 就主动停止异步补偿机制，释放所有goroutine，返回错误信息并释放分布式锁
+	errLimit Limiter
+	cancel   context.CancelFunc
 }
 
 func NewMessageTable(dbs map[string]DatabaseTable,
 	fn ShardingFn,
 	producer sarama.SyncProducer,
 	l logger.Logger,
+	lock *dl.Client,
 	opts ...Options) MessagePusher {
 	once.Do(func() {
 		messageTable = &MessageTable{
@@ -101,10 +110,12 @@ func NewMessageTable(dbs map[string]DatabaseTable,
 			producer: producer,
 			closeCh:  make(chan struct{}),
 			once:     sync.Once{},
+			lock:     lock,
 			interval: DefaultInterval,
 			limit:    DefaultLimit,
 			l:        l,
 		}
+
 		for _, opt := range opts {
 			opt(messageTable)
 		}
@@ -114,17 +125,78 @@ func NewMessageTable(dbs map[string]DatabaseTable,
 }
 
 func (m *MessageTable) AsyncWork(ctx context.Context) error {
-	// 查询未发送的消息
+	ctx, m.cancel = context.WithCancel(ctx)
+	// 先尝试获取分布式锁
+	lock, err := m.lock.TryLock(ctx, LockKey, LockID, time.Minute)
+	if err != nil {
+		m.l.Errorf("尝试获取分布式锁失败",
+			logger.Field{Key: "error", Val: err.Error()})
+		return err
+	}
+
+	m.l.Infof("获取分布式锁成功")
+
+	errCh := make(chan error)
+	defer close(errCh)
+
+	refreshCloseCh := make(chan struct{})
+
+	// 异步定时续约分布式锁
+	go func() {
+		defer func() {
+			close(refreshCloseCh)
+		}()
+
+		er := lock.AutoRefresh(context.Background(), 5*time.Second, 15*time.Second, time.Second)
+		if er != nil {
+			errCh <- er
+		}
+
+		m.l.Infof("结束续约协程")
+	}()
+
+	// 异步监控是否需要主动释放分布式锁
+	go func() {
+		defer func() {
+			_ = lock.UnLock(ctx)
+		}()
+
+		for {
+			select {
+			case <-ctx.Done():
+				m.l.Debugf("超时取消")
+				return
+			case <-m.closeCh:
+				m.l.Debugf("收到退出信号")
+				return
+			case <-refreshCloseCh:
+				m.l.Debugf("收到续约关闭信号")
+				return
+			}
+		}
+	}()
+
+	errLimit := NewSlidingWindow(5, 5*time.Second)
+
+	// 批量查询未发送的消息，执行异步补偿任务
 	var eg errgroup.Group
 	for _, d := range m.dbs {
 		dt := d
 		for _, table := range dt.tables {
+			tb := table
 			eg.Go(func() error {
 				for {
 					select {
 					case <-ctx.Done():
+						m.l.Debugf("超时取消", logger.Field{Key: "table", Val: tb})
 						return ctx.Err()
 					case <-m.closeCh:
+						m.l.Debugf("收到停止信号，退出补偿协程",
+							logger.Field{Key: "table", Val: tb})
+						return nil
+					case <-refreshCloseCh:
+						// 分布式锁异步刷新结束，锁已释放
+						m.l.Debugf("收到续约关闭信号")
 						return nil
 					default:
 					}
@@ -132,13 +204,18 @@ func (m *MessageTable) AsyncWork(ctx context.Context) error {
 					ctxl, cancel := context.WithTimeout(ctx, time.Second)
 					now := time.Now().UnixMilli() - m.interval.Milliseconds()
 					var msgs []Messages
-					err := dt.db.WithContext(ctx).Model(&Messages{}).Table(table).
+					err = dt.db.WithContext(ctx).Model(&Messages{}).Table(tb).
 						Where("status = ? AND updated_at < ?", MessageStatusNotSend, now).
-						Offset(0).
-						Limit(m.limit).
-						Find(&msgs).Error
-					cancel()
+						Offset(0).Limit(m.limit).Find(&msgs).Error
 					if err != nil {
+						if m.isMiddlewareError(err) {
+							ok, _ := errLimit.Allow(ctx)
+							if !ok {
+								m.l.Errorf("MySQL链接异常，停止异步补偿任务")
+								m.cancel()
+								return ErrOverLimit
+							}
+						}
 						m.l.Errorf("批量查询未发送消息失败", logger.Field{Key: "error", Val: err.Error()})
 						continue
 					}
@@ -152,6 +229,14 @@ func (m *MessageTable) AsyncWork(ctx context.Context) error {
 						// 同步推送事务消息到消息队列，调用方不关心推送状态
 						err = m.sendMessage(msg)
 						if err != nil {
+							if m.isMiddlewareError(err) {
+								ok, _ := errLimit.Allow(ctx)
+								if !ok {
+									m.l.Errorf("Kafka链接异常，停止异步补偿任务")
+									m.cancel()
+									return ErrOverLimit
+								}
+							}
 							m.l.Errorf("异步补偿任务推送失败",
 								logger.Field{Key: "id", Val: msg.ID},
 								logger.Field{Key: "error", Val: err.Error()})
@@ -164,16 +249,19 @@ func (m *MessageTable) AsyncWork(ctx context.Context) error {
 						continue
 					}
 
+					m.l.Debugf("异步补偿推送消息成功，消息id为：%s", logger.Field{
+						Key: "IDS",
+						Val: batchIDS,
+					})
+
 					// 批量更新消息状态，这个地方可能会出现更新失败但推送成功的情况，还会被捞出来发送
 					// 消息消费方需要实现消息幂等
 					ctxl, cancel = context.WithTimeout(ctx, time.Second)
-					err = dt.db.WithContext(ctxl).Model(&Messages{}).
-						Table(table).
-						Where("id IN (?)", batchIDS).
-						Updates(map[string]interface{}{
-							"status":     MessageStatusSendSuccess,
-							"updated_at": time.Now().UnixMilli(),
-						}).Error
+					err = dt.db.Debug().WithContext(ctxl).Table(tb).
+						Where("id IN (?)", batchIDS).Updates(map[string]interface{}{
+						"status":     MessageStatusSendSuccess,
+						"updated_at": time.Now().UnixMilli(),
+					}).Error
 					cancel()
 					if err != nil {
 						m.l.Errorf("异步补偿批量更新状态失败", logger.Field{Key: "error", Val: err.Error()})
@@ -182,12 +270,23 @@ func (m *MessageTable) AsyncWork(ctx context.Context) error {
 			})
 		}
 	}
-	return eg.Wait()
+	if err = eg.Wait(); err != nil {
+		return err
+	}
+
+	m.l.Infof("结束goroutine")
+
+	select {
+	case err = <-errCh:
+		return err
+	default:
+		return nil
+	}
 }
 
 func (m *MessageTable) ExecTo(ctx context.Context, fn BizFn, shardingKey any) error {
 	// 通过分片方法来获取数据库和表信息
-	dst, err := m.Sharding(ctx, shardingKey)
+	dst, err := m.Sharding(shardingKey)
 	if err != nil {
 		m.l.Errorf("获取分片信息失败",
 			logger.Field{Key: "Sharding Key", Val: shardingKey},
@@ -236,7 +335,7 @@ func (m *MessageTable) ExecTo(ctx context.Context, fn BizFn, shardingKey any) er
 	}
 
 	// 更新消息推送状态
-	return dt.db.WithContext(ctx).Model(&Messages{}).
+	return dt.db.WithContext(ctx).Table(dst.Table).
 		Where("id = ?", msg.ID).
 		Updates(map[string]interface{}{
 			"status":     MessageStatusSendSuccess,
@@ -253,8 +352,20 @@ func (m *MessageTable) sendMessage(msg Messages) error {
 	return err
 }
 
+func (m *MessageTable) isMiddlewareError(err error) bool {
+	switch {
+	case errors.Is(err, gorm.ErrRecordNotFound), errors.Is(err, context.DeadlineExceeded):
+		return false
+	case errors.Is(err, sarama.ErrMessageTooLarge):
+		return false
+	default:
+		return true
+	}
+}
+
 func (m *MessageTable) Close() {
-	once.Do(func() {
+
+	m.once.Do(func() {
 		close(m.closeCh)
 	})
 }

@@ -44,3 +44,9 @@ func (s MessageStatus) String() string {
 		return "unknown status"
 	}
 }
+
+// LockKey 分布式锁的key
+const LockKey = "local_table_locker"
+
+// LockID 分布式锁的唯一ID标识
+const LockID = "local_table_id"
