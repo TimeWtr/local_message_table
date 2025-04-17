@@ -15,9 +15,12 @@
 package local_message_table
 
 import (
+	"encoding/json"
 	"errors"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/IBM/sarama"
 	"golang.org/x/net/context"
@@ -95,6 +98,8 @@ type MessageTable struct {
 	// 就主动停止异步补偿机制，释放所有goroutine，返回错误信息并释放分布式锁
 	errLimit Limiter
 	cancel   context.CancelFunc
+	// UUID 生成器
+	u uuid.UUID
 }
 
 func NewMessageTable(dbs map[string]DatabaseTable,
@@ -104,6 +109,11 @@ func NewMessageTable(dbs map[string]DatabaseTable,
 	lock *dl.Client,
 	opts ...Options) MessagePusher {
 	once.Do(func() {
+		u, err := uuid.NewUUID()
+		if err != nil {
+			panic(err)
+		}
+
 		messageTable = &MessageTable{
 			dbs:      dbs,
 			Sharding: fn,
@@ -114,6 +124,7 @@ func NewMessageTable(dbs map[string]DatabaseTable,
 			interval: DefaultInterval,
 			limit:    DefaultLimit,
 			l:        l,
+			u:        u,
 		}
 
 		for _, opt := range opts {
@@ -316,6 +327,10 @@ func (m *MessageTable) ExecTo(ctx context.Context, fn BizFn, shardingKey any) er
 		now := time.Now().UnixMilli()
 		msg.CreatedAt = now
 		msg.UpdatedAt = now
+		if msg.MessageID == "" {
+			msg.MessageID = m.u.String()
+		}
+
 		return tx.Model(&Messages{}).Table(dst.Table).Create(&msg).Error
 	})
 	if err != nil {
@@ -344,9 +359,19 @@ func (m *MessageTable) ExecTo(ctx context.Context, fn BizFn, shardingKey any) er
 }
 
 func (m *MessageTable) sendMessage(msg Messages) error {
-	_, _, err := m.producer.SendMessage(&sarama.ProducerMessage{
+	val := SendMessage{
+		MessageID: msg.MessageID,
+		Content:   msg.Content,
+	}
+
+	bs, err := json.Marshal(val)
+	if err != nil {
+		return err
+	}
+
+	_, _, err = m.producer.SendMessage(&sarama.ProducerMessage{
 		Topic: msg.Topic,
-		Value: sarama.StringEncoder(msg.Content),
+		Value: sarama.ByteEncoder(bs),
 	})
 
 	return err
