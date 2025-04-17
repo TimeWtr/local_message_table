@@ -17,9 +17,15 @@ package local_message_table
 type Messages struct {
 	ID        int64  `json:"id" gorm:"column:id;type:bigint;primaryKey;autoIncrement;comment:id"`
 	Biz       string `json:"biz" gorm:"column:biz;type:varchar(256);not null;comment:biz"`
+	MessageID string `json:"message_id" gorm:"column:message_id;type:varchar(100);comment:message_id"`
 	Topic     string `json:"topic" gorm:"column:topic;type:varchar(256);not null;comment:topic"`
 	Content   string `json:"content" gorm:"column:content;type:text;not null;comment:content"`
 	Status    int    `json:"status" gorm:"column:status;type:tinyint(1);not null;comment:status"`
 	CreatedAt int64  `json:"created_at" gorm:"column:created_at;type:bigint;not null;comment:created_at"`
 	UpdatedAt int64  `json:"updated_at" gorm:"column:updated_at;type:bigint;not null;comment:updated_at"`
+}
+
+type SendMessage struct {
+	MessageID string
+	Content   string
 }

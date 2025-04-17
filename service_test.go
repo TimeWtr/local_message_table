@@ -68,7 +68,7 @@ func TestNewMessageTable_Insert_And_Sync(t *testing.T) {
 		log.New(os.Stdout, "\r\n", log.LstdFlags), // io writer
 		lg.Config{
 			SlowThreshold:             time.Second, // Slow SQL threshold
-			LogLevel:                  lg.Silent,   // Log level
+			LogLevel:                  lg.Info,     // Log level
 			IgnoreRecordNotFoundError: true,        // Ignore ErrRecordNotFound error for logger
 			ParameterizedQueries:      false,       // Don't include params in the SQL log
 			Colorful:                  true,        // Disable color
@@ -124,7 +124,8 @@ func TestNewMessageTable_Insert_And_Sync(t *testing.T) {
 			t.Logf("async work err: %s", err.Error())
 		}
 	}()
-	for i := 1; i <= 100; i++ {
+
+	for i := 1; i <= 1000; i++ {
 		err = mp.ExecTo(context.Background(), func(ctx context.Context, tx *gorm.DB) (Messages, error) {
 			return Messages{
 				Biz:     "test Biz",
@@ -260,7 +261,7 @@ func TestNewMessageTable_MiddleWare_Error(t *testing.T) {
 	producer, err := sarama.NewSyncProducer([]string{"127.0.0.1:9092"}, nil)
 	assert.Nil(t, err)
 	config := zap.NewDevelopmentConfig()
-	config.Level.SetLevel(zap.InfoLevel)
+	config.Level.SetLevel(zap.ErrorLevel)
 	zl, err := config.Build()
 	assert.Nil(t, err)
 
@@ -292,4 +293,74 @@ func TestNewMessageTable_MiddleWare_Error(t *testing.T) {
 	mp.Close()
 	wg.Wait()
 	t.Log("done!")
+}
+
+func BenchmarkNewMessageTable_Insert_And_Sync(b *testing.B) {
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     "127.0.0.1:6379",
+		Username: "root",
+		Password: "",
+	})
+
+	newLogger := lg.New(
+		log.New(os.Stdout, "\r\n", log.LstdFlags), // io writer
+		lg.Config{
+			SlowThreshold:             time.Second, // Slow SQL threshold
+			LogLevel:                  lg.Info,     // Log level
+			IgnoreRecordNotFoundError: true,        // Ignore ErrRecordNotFound error for logger
+			ParameterizedQueries:      false,       // Don't include params in the SQL log
+			Colorful:                  false,       // Disable color
+		},
+	)
+
+	dbs := make(map[string]DatabaseTable)
+	dsn1 := "root:root@tcp(127.0.0.1:13306)/project?charset=utf8mb4&parseTime=True&loc=Local"
+	db1, err := gorm.Open(mysql.Open(dsn1), &gorm.Config{
+		Logger: newLogger,
+	})
+	assert.Nil(b, err)
+	dbs["db_0"] = DatabaseTable{db: db1}
+
+	dsn2 := "root:root@tcp(127.0.0.1:33061)/project?charset=utf8mb4&parseTime=True&loc=Local"
+	db2, err := gorm.Open(mysql.Open(dsn2), &gorm.Config{
+		Logger: newLogger,
+	})
+	assert.Nil(b, err)
+	dbs["db_1"] = DatabaseTable{db: db2}
+
+	producer, err := sarama.NewSyncProducer([]string{"127.0.0.1:9092"}, nil)
+	assert.Nil(b, err)
+	config := zap.NewDevelopmentConfig()
+	config.Level.SetLevel(zap.ErrorLevel)
+	zl, err := config.Build()
+	assert.Nil(b, err)
+
+	mp := NewMessageTable(dbs, CalculateSharding, producer,
+		logger.NewZapLogger(zl),
+		dl.NewClient(rdb))
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err = mp.AsyncWork(context.Background())
+		if err != nil {
+			b.Logf("async work err: %s", err.Error())
+		}
+	}()
+
+	for i := 1; i <= b.N; i++ {
+		err = mp.ExecTo(context.Background(), func(ctx context.Context, tx *gorm.DB) (Messages, error) {
+			return Messages{
+				Biz:     "test Biz",
+				Topic:   "test_topic",
+				Content: "test content",
+			}, nil
+		}, i+1)
+		assert.Nil(b, err)
+	}
+
+	mp.Close()
+	wg.Wait()
+	b.Log("done!")
 }
