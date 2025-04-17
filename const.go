@@ -21,8 +21,6 @@ const (
 	DefaultLimit    = 100
 )
 
-type MessageStatus int
-
 const (
 	// MessageStatusNotSend 未发送状态
 	MessageStatusNotSend MessageStatus = iota
@@ -31,6 +29,12 @@ const (
 	// MessageStatusSendFailure 发送失败
 	MessageStatusSendFailure
 )
+
+type MessageStatus int
+
+func (s MessageStatus) Int() int {
+	return int(s)
+}
 
 func (s MessageStatus) String() string {
 	switch s {
