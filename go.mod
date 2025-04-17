@@ -6,7 +6,6 @@ require (
 	github.com/IBM/sarama v1.45.1
 	github.com/TimeWtr/Bitly v0.0.1
 	github.com/TimeWtr/dis_lock v1.0.5
-	github.com/google/uuid v1.6.0
 	github.com/redis/go-redis/v9 v9.7.0
 	github.com/stretchr/testify v1.10.0
 	go.uber.org/zap v1.27.0
@@ -25,6 +24,7 @@ require (
 	github.com/eapache/queue v1.1.0 // indirect
 	github.com/go-sql-driver/mysql v1.7.0 // indirect
 	github.com/golang/snappy v0.0.4 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/hashicorp/errwrap v1.0.0 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/hashicorp/go-uuid v1.0.3 // indirect
