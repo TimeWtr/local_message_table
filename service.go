@@ -35,7 +35,7 @@ var (
 )
 
 // BizFn 执行业务的方法
-type BizFn func(ctx context.Context, tx *gorm.DB) (Messages, error)
+type BizFn func(ctx context.Context, tx *gorm.DB) ([]Messages, error)
 
 // ShardingFn 执行分片的方法
 type ShardingFn func(key any) (Dst, error)
@@ -62,6 +62,9 @@ type MessagePusher interface {
 	AsyncWork(ctx context.Context) error
 	// ExecTo 用于执行业务、写入消息表、同步推送事务消息
 	ExecTo(ctx context.Context, fn BizFn, shardingKey any) error
+	// BatchExecTo 批量写入分片数据，批量使用时需要先把需要批量操作的数据组装好，即这一批数据都是
+	// 同库同表的，shardingKey只需要传一个即可，也必须落到当前的库表
+	BatchExecTo(ctx context.Context, fn BizFn, shardingKey any) error
 	// Close 关闭本地消息表
 	Close()
 }
@@ -297,7 +300,7 @@ func (m *MessageTable) ExecTo(ctx context.Context, fn BizFn, shardingKey any) er
 	}
 
 	dt := m.dbs[dst.Database]
-	var msg Messages
+	var msg []Messages
 	// 开启事务
 	err = dt.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// 执行业务程序
@@ -306,21 +309,21 @@ func (m *MessageTable) ExecTo(ctx context.Context, fn BizFn, shardingKey any) er
 			return err
 		}
 
-		if msg.Topic == "" {
+		if msg[0].Topic == "" {
 			return ErrTopicEmpty
 		}
 
-		if msg.Content == "" {
+		if msg[0].Content == "" {
 			return ErrContentEmpty
 		}
 
 		now := time.Now().UnixMilli()
-		msg.CreatedAt = now
-		msg.UpdatedAt = now
+		msg[0].CreatedAt = now
+		msg[0].UpdatedAt = now
 		return tx.Model(&Messages{}).Table(dst.Table).Create(&msg).Error
 	})
 	if err != nil {
-		m.l.Errorf("执行失败",
+		m.l.Errorf("单次执行失败",
 			logger.Field{Key: "Sharding Key", Val: shardingKey},
 			logger.Field{Key: "database", Val: dst.Database},
 			logger.Field{Key: "error", Val: err.Error()})
@@ -328,16 +331,83 @@ func (m *MessageTable) ExecTo(ctx context.Context, fn BizFn, shardingKey any) er
 	}
 
 	// 同步推送事务消息到消息队列，调用方不关心推送状态
-	if err = m.sendMessage(msg); err != nil {
-		m.l.Errorf("同步推送失败",
-			logger.Field{Key: "id", Val: msg.ID},
+	if err = m.sendMessage(msg[0]); err != nil {
+		m.l.Errorf("单次同步推送失败",
+			logger.Field{Key: "id", Val: msg[0].ID},
 			logger.Field{Key: "error", Val: err.Error()})
 		return nil
 	}
 
 	// 更新消息推送状态
 	return dt.db.WithContext(ctx).Table(dst.Table).
-		Where("id = ?", msg.ID).
+		Where("id = ?", msg[0].ID).
+		Updates(map[string]interface{}{
+			"status":     MessageStatusSendSuccess,
+			"updated_at": time.Now().UnixMilli(),
+		}).Error
+}
+
+func (m *MessageTable) BatchExecTo(ctx context.Context, fn BizFn, shardingKey any) error {
+	// 通过分片方法来获取数据库和表信息
+	dst, err := m.Sharding(shardingKey)
+	if err != nil {
+		m.l.Errorf("获取分片信息失败",
+			logger.Field{Key: "Sharding Key", Val: shardingKey},
+			logger.Field{Key: "error", Val: err.Error()},
+		)
+		return err
+	}
+
+	dt := m.dbs[dst.Database]
+	var msgs []Messages
+	err = dt.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// 先执行业务
+		msgs, err = fn(ctx, tx)
+		if err != nil {
+			return err
+		}
+
+		for _, msg := range msgs {
+			if msg.Topic == "" {
+				return ErrTopicEmpty
+			}
+
+			if msg.Content == "" {
+				return ErrContentEmpty
+			}
+
+			now := time.Now().UnixMilli()
+			msg.CreatedAt = now
+			msg.UpdatedAt = now
+		}
+
+		return tx.Model(&Messages{}).Table(dst.Table).Create(&msgs).Error
+	})
+
+	if err != nil {
+		m.l.Errorf("批量执行失败",
+			logger.Field{Key: "Sharding Key", Val: shardingKey},
+			logger.Field{Key: "database", Val: dst.Database},
+			logger.Field{Key: "error", Val: err.Error()})
+		return err
+	}
+
+	// 同步推送事务消息到消息队列，调用方不关心推送状态
+	if err = m.sendMessageBatch(msgs); err != nil {
+		m.l.Errorf("批量同步推送失败",
+			logger.Field{Key: "id", Val: msgs},
+			logger.Field{Key: "error", Val: err.Error()})
+		return nil
+	}
+
+	var batchIDS []int64
+	for _, msg := range msgs {
+		batchIDS = append(batchIDS, msg.ID)
+	}
+
+	// 更新消息推送状态
+	return dt.db.WithContext(ctx).Table(dst.Table).
+		Where("id IN (?)", batchIDS).
 		Updates(map[string]interface{}{
 			"status":     MessageStatusSendSuccess,
 			"updated_at": time.Now().UnixMilli(),
@@ -361,6 +431,28 @@ func (m *MessageTable) sendMessage(msg Messages) error {
 	})
 
 	return err
+}
+
+// sendMessageBatch 批量推送消息到Kafka
+func (m *MessageTable) sendMessageBatch(msgs []Messages) error {
+	var arr []*sarama.ProducerMessage
+	for _, msg := range msgs {
+		data := SendMessage{
+			MessageID: msg.MessageID,
+			Content:   msg.Content,
+		}
+		bs, err := json.Marshal(data)
+		if err != nil {
+			return err
+		}
+
+		arr = append(arr, &sarama.ProducerMessage{
+			Topic: msg.Topic,
+			Value: sarama.ByteEncoder(bs),
+		})
+	}
+
+	return m.producer.SendMessages(arr)
 }
 
 func (m *MessageTable) isMiddlewareError(err error) bool {
