@@ -24,6 +24,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/IBM/sarama"
 	"github.com/TimeWtr/Bitly/pkg/logger"
 	dl "github.com/TimeWtr/dis_lock"
@@ -126,14 +128,141 @@ func TestNewMessageTable_Insert_And_Sync(t *testing.T) {
 	}()
 
 	for i := 1; i <= 1000; i++ {
-		err = mp.ExecTo(context.Background(), func(ctx context.Context, tx *gorm.DB) (Messages, error) {
-			return Messages{
-				Biz:     "test Biz",
-				Topic:   "test_topic",
-				Content: "test content",
+		err = mp.ExecTo(context.Background(), func(ctx context.Context, tx *gorm.DB) ([]Messages, error) {
+			return []Messages{
+				{
+					Biz:     "test Biz",
+					Topic:   "test_topic",
+					Content: "test content",
+				},
 			}, nil
 		}, i+1)
 		assert.Nil(t, err)
+	}
+
+	mp.Close()
+	wg.Wait()
+	t.Log("done!")
+}
+
+func TestNewMessageTable_Batch_Insert_And_Sync(t *testing.T) {
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     "127.0.0.1:6379",
+		Username: "root",
+		Password: "",
+	})
+
+	newLogger := lg.New(
+		log.New(os.Stdout, "\r\n", log.LstdFlags), // io writer
+		lg.Config{
+			SlowThreshold:             time.Second, // Slow SQL threshold
+			LogLevel:                  lg.Info,     // Log level
+			IgnoreRecordNotFoundError: true,        // Ignore ErrRecordNotFound error for logger
+			ParameterizedQueries:      false,       // Don't include params in the SQL log
+			Colorful:                  true,        // Disable color
+		},
+	)
+
+	dbs := make(map[string]DatabaseTable)
+	dsn1 := "root:root@tcp(127.0.0.1:13306)/project?charset=utf8mb4&parseTime=True&loc=Local"
+	db1, err := gorm.Open(mysql.Open(dsn1), &gorm.Config{
+		Logger: newLogger,
+	})
+	assert.Nil(t, err)
+	dbs["db_0"] = DatabaseTable{db: db1}
+
+	dsn2 := "root:root@tcp(127.0.0.1:33061)/project?charset=utf8mb4&parseTime=True&loc=Local"
+	db2, err := gorm.Open(mysql.Open(dsn2), &gorm.Config{
+		Logger: newLogger,
+	})
+	assert.Nil(t, err)
+	dbs["db_1"] = DatabaseTable{db: db2}
+
+	// 创建10张消息表分表
+	for key, item := range dbs {
+		dt := item
+		for i := 1; i <= 10; i++ {
+			tableName := fmt.Sprintf("message_%d", i)
+			if !dt.db.Migrator().HasTable(tableName) {
+				err = dt.db.Table(tableName).AutoMigrate(&Messages{})
+				assert.Nil(t, err)
+			}
+			dt.tables = append(dt.tables, tableName)
+		}
+		dbs[key] = dt
+	}
+
+	producer, err := sarama.NewSyncProducer([]string{"127.0.0.1:9092"}, nil)
+	assert.Nil(t, err)
+	config := zap.NewDevelopmentConfig()
+	config.Level.SetLevel(zap.DebugLevel)
+	zl, err := config.Build()
+	assert.Nil(t, err)
+
+	mp := NewMessageTable(dbs, CalculateSharding, producer,
+		logger.NewZapLogger(zl),
+		dl.NewClient(rdb))
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		err = mp.AsyncWork(context.Background())
+		if err != nil {
+			t.Logf("async work err: %s", err.Error())
+		}
+	}()
+
+	smp := make(map[string][]int)
+	for i := 1; i <= 1000000; i++ {
+		dst, er := CalculateSharding(i)
+		assert.Nil(t, er)
+		key := fmt.Sprintf("%s-%s", dst.Database, dst.Table)
+		smp[key] = append(smp[key], i)
+	}
+
+	length := 500
+	uu, _ := uuid.NewUUID()
+	for _, val := range smp {
+		batchArr := make([]int, 0, length)
+		for _, item := range val {
+			batchArr = append(batchArr, item)
+			if len(batchArr) == length {
+				mp.BatchExecTo(context.Background(), func(ctx context.Context, tx *gorm.DB) ([]Messages, error) {
+					// 批量写入
+					var msgs []Messages
+					for _, j := range batchArr {
+						msgs = append(msgs, Messages{
+							MessageID: uu.String(),
+							Biz:       fmt.Sprintf("test Biz - %d", j),
+							Topic:     "test_topic",
+							Content:   "test content",
+						})
+					}
+
+					return msgs, nil
+				}, batchArr[0])
+				batchArr = batchArr[:0]
+			}
+		}
+
+		// 如果 batchArr 还有剩余元素，调用 BatchExecTo
+		if len(batchArr) > 0 {
+			mp.BatchExecTo(context.Background(), func(ctx context.Context, tx *gorm.DB) ([]Messages, error) {
+				var msgs []Messages
+				for _, item := range batchArr {
+					msgs = append(msgs, Messages{
+						MessageID: uu.String(),
+						Biz:       fmt.Sprintf("test Biz - %d", item),
+						Topic:     "test_topic",
+						Content:   "test content",
+					})
+				}
+				// 清空 batchArr
+				batchArr = batchArr[:0]
+				return msgs, nil
+			}, batchArr[0])
+		}
 	}
 
 	mp.Close()
@@ -196,11 +325,13 @@ func TestNewMessageTable_Refresh_Failure_ContextDeadline(t *testing.T) {
 		assert.Equal(t, context.DeadlineExceeded, err)
 	}()
 	for i := 1; i <= 2000; i++ {
-		err = mp.ExecTo(context.Background(), func(ctx context.Context, tx *gorm.DB) (Messages, error) {
-			return Messages{
-				Biz:     "test Biz",
-				Topic:   "test_topic",
-				Content: "test content",
+		err = mp.ExecTo(context.Background(), func(ctx context.Context, tx *gorm.DB) ([]Messages, error) {
+			return []Messages{
+				{
+					Biz:     "test Biz",
+					Topic:   "test_topic",
+					Content: "test content",
+				},
 			}, nil
 		}, i+1)
 		assert.Nil(t, err)
@@ -279,11 +410,13 @@ func TestNewMessageTable_MiddleWare_Error(t *testing.T) {
 		}
 	}()
 	for i := 1; i <= 10; i++ {
-		err = mp.ExecTo(context.Background(), func(ctx context.Context, tx *gorm.DB) (Messages, error) {
-			return Messages{
-				Biz:     "test Biz",
-				Topic:   "test_topic",
-				Content: "test content",
+		err = mp.ExecTo(context.Background(), func(ctx context.Context, tx *gorm.DB) ([]Messages, error) {
+			return []Messages{
+				{
+					Biz:     "test Biz",
+					Topic:   "test_topic",
+					Content: "test content",
+				},
 			}, nil
 		}, i+1)
 		time.Sleep(time.Second)
@@ -350,11 +483,13 @@ func BenchmarkNewMessageTable_Insert_And_Sync(b *testing.B) {
 	}()
 
 	for i := 1; i <= b.N; i++ {
-		err = mp.ExecTo(context.Background(), func(ctx context.Context, tx *gorm.DB) (Messages, error) {
-			return Messages{
-				Biz:     "test Biz",
-				Topic:   "test_topic",
-				Content: "test content",
+		err = mp.ExecTo(context.Background(), func(ctx context.Context, tx *gorm.DB) ([]Messages, error) {
+			return []Messages{
+				{
+					Biz:     "test Biz",
+					Topic:   "test_topic",
+					Content: "test content",
+				},
 			}, nil
 		}, i+1)
 		assert.Nil(b, err)
